@@ -37,10 +37,16 @@ constexpr uint64_t kGiB        = 1024ULL * kMiB;
 constexpr double kBytesPerParam = kFp8 ? 1.0 : 1.0;  // FP8 checkpoint, 1 byte
 
 // Elective constants (user-tunable for the host)
-double g_vram_gib   = 3.8;   // ~3.8 GB usable VRAM
-double g_ram_gib    = 5.0;   // native budget target (free RAM)
-double g_pcie_gbs   = 10.0;  // PCIe Gen3 x16 effective H2D bandwidth
-double g_ssd_gbs    = 2.5;   // downstream for SSD cold spill
+double g_vram_gib   = 3.8;    // ~3.8 GB usable VRAM
+double g_ram_gib    = 8.0;    // 8 GB DDR3 (H61 board — single channel)
+double g_pcie_gbs   = 4.5;    // PCIe Gen2 x16 (H61) effective H2D bandwidth (~4-5 GB/s)
+double g_ssd_gbs    = 0.3;    // SATA-2 SSD on H61 (contemporary boards cap at SATA2)
+double g_hdd_gbs    = 0.11;    // SATA-2 HDD worst case (~110 MB/s)
+
+// Quantization policy the user is implementing (automatic Q4 to save RAM/VRAM).
+// 1.0 = FP8 (1 byte/param). 0.5 = Q4 (nibble/param). This HALVES the bytes
+// that must move, which is the single biggest lever on a Gen2/SATA2 rig.
+double g_bytes_per_param = 0.5;
 
 uint64_t params_embeddings() { return kVocab * kHidden; }        // ~508M
 uint64_t params_lm_head()    { return kVocab * kHidden; }        // ~508M
@@ -73,7 +79,7 @@ uint64_t params_shared_total() {
     return kLayers * per;  // shared experts are the same block size
 }
 
-uint64_t bytes_of(uint64_t params) { return (uint64_t)(params * kBytesPerParam); }
+uint64_t bytes_of(uint64_t params) { return (uint64_t)(params * g_bytes_per_param); }
 
 uint64_t moe_expert_bytes() {
     return bytes_of(params_moe_total() / (kLayers * kExpertsPerLayer));
@@ -136,11 +142,24 @@ int main() {
     std::printf("--- Per-token decode physics ---\n");
     std::printf(" routed-expert bytes touched per token     : %4.2f GB\n",
                 per_token_moe / (double)kGiB);
-    std::printf("  if 100%% served from RAM (hot) @ %.0f GB/s : %.0f ms\n",
+    std::printf("  if 100%% served from RAM @ %.1f GB/s (Gen2): %.0f ms\n",
                 g_pcie_gbs, per_token_moe / g_pcie_gbs / 1e6);
-    std::printf("  if 50%% cold from SSD @ %.1f GB/s          : ~%.0f ms  <-- danger zone\n",
+    std::printf("  if 50%% cold from SSD @ %.2f GB/s (SATA2)  : ~%.0f ms  <-- danger\n",
                 g_ssd_gbs,
                 (0.5 * per_token_moe / g_ssd_gbs + 0.5 * per_token_moe / g_pcie_gbs) / 1e6);
+
+    // ---- Quantization lever: FP8 vs Q4 ----
+    const double fp8_moe_t = bytes_of(params_moe_total() / 0.5);      // back out FP8 bytes
+    const double q4_moe_t  = fp8_moe_t * 0.5;                         // half
+    std::printf("\n--- Quantization lever (auto-Q4 the user is building) ---\n");
+    std::printf(" full MoE @ FP8 : %4.1f GB   @ Q4 : %4.1f GB  (2x smaller)\n",
+                fp8_moe_t / (double)kGiB, q4_moe_t / (double)kGiB);
+    std::printf(" bytes/token    : FP8 %.2f GB  |  Q4 %.2f GB\n",
+                kLayers * kTopK * fp8_moe_t / (double)(kLayers * kExpertsPerLayer) / (double)kGiB,
+                kLayers * kTopK * q4_moe_t  / (double)(kLayers * kExpertsPerLayer) / (double)kGiB);
+    std::printf(" RAM-held (8GB) expert slots: FP8 %.0f | Q4 %.0f\n",
+                8.0 * kGiB / fp8_moe_t * (kLayers * kExpertsPerLayer),
+                8.0 * kGiB / q4_moe_t  * (kLayers * kExpertsPerLayer));
 
     // ---- Compute side: is 1 token/s flop-bound or bandwidth-bound? ----
     // ~3B active params/token -> ~6 GFLOP; consumers fp8 do ~200-500 GFLOPS.
@@ -150,26 +169,33 @@ int main() {
                 active_gflop, gpu_gflops, active_gflop / gpu_gflops * 1000.0);
 
     // ---- Verdict ----
+    // Q4 halves the per-token bytes, so use the Q4 numbers for the estimate.
+    const double q4_moe_ex = q4_moe_t / (double)(kLayers * kExpertsPerLayer);
+    const double per_token_q4 = kLayers * kTopK * q4_moe_ex;
     const double estimate_ms =
         must_hot_in_vram <= vram_b
-        ? (per_token_moe / g_pcie_gbs / 1e6) + (active_gflop / gpu_gflops * 1000.0)
+        ? (per_token_q4 / g_pcie_gbs / 1e6) + (active_gflop / gpu_gflops * 1000.0)
         : 1e9;
 
     std::printf("\n--- Verdict ---\n");
     if (must_hot_in_vram <= vram_b) {
         std::printf(" ALWAYS-HOT set FITS in VRAM (%.1f/%.1f GB).\n",
                     must_hot_in_vram / (double)kGiB, g_vram_gib);
-        std::printf(" Projected warm-decode, experts served from RAM: %.0f ms/token.\n\n",
+        std::printf(" Projected warm-decode, Q4 experts served from RAM: ~%.0f ms/token.\n\n",
                     estimate_ms);
-        std::printf(" CONCLUSION: 1 token/s is PHYSICALLY REACHABLE for the warm/decode\n");
-        std::printf(" regime IF (1) attention+shared+lm_head stay resident in VRAM,\n");
-        std::printf(" (2) active-expert working set is served from RAM (hot) via\n");
-        std::printf(" routing-predictor prefetch, and (3) Python overhead is removed.\n");
-        std::printf(" The remaining risk is pure SSD-leakage at long generations.\n");
+        std::printf(" CONCLUSION: even on PCIe Gen2 + DDR3 (8GB RAM, 3.8GB VRAM),\n");
+        std::printf(" 1 token/s is PHYSICALLY REACHABLE for the warm-decode regime IF:\n");
+        std::printf("  (1) attention + shared experts + lm_head stay resident in VRAM\n");
+        std::printf("      (%.1f GB of 3.8 GB),\n", must_hot_in_vram / (double)kGiB);
+        std::printf("  (2) the 320 active experts/token are served Q4 from RAM (hot)\n");
+        std::printf("      via routing-predictor prefetch (never from the SATA2 SSD),\n");
+        std::printf("  (3) Python overhead is removed from the per-token hot loop.\n");
+        std::printf(" The killer is SSD leakage: at SATA2, even 10%% cold costs ~%.0f ms.\n",
+                    (0.1 * per_token_q4 / g_ssd_gbs + 0.9 * per_token_q4 / g_pcie_gbs) / 1e6);
     } else {
         std::printf(" ALWAYS-HOT set does NOT fit (%.1f/%.1f GB) -> need to demote\n",
                     must_hot_in_vram / (double)kGiB, g_vram_gib);
-        std::printf(" lm_head or refit. 1 tk/s requires either a smaller lm_head trade\n");
+        std::printf(" lm_head to RAM or refit. 1 tk/s requires a smaller lm_head trade\n");
         std::printf(" or an SSD pipeline; otherwise the budget does not close.\n");
     }
     std::printf("===========================================================\n");
