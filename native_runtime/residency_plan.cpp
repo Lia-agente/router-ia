@@ -40,12 +40,12 @@ constexpr double kBytesPerParam = kFp8 ? 1.0 : 1.0;  // FP8 checkpoint, 1 byte
 double g_vram_gib   = 3.8;    // ~3.8 GB usable VRAM
 double g_ram_gib    = 8.0;    // 8 GB DDR3 (H61 board — single channel)
 double g_pcie_gbs   = 4.5;    // PCIe Gen2 x16 (H61) effective H2D bandwidth (~4-5 GB/s)
-double g_ssd_gbs    = 0.3;    // SATA-2 SSD on H61 (contemporary boards cap at SATA2)
+double g_ssd_gbs    = 0.5;    // NVMe via adapter on H61 (~500 MB/s, ~1ms-500ms latency)
 double g_hdd_gbs    = 0.11;    // SATA-2 HDD worst case (~110 MB/s)
 
 // Quantization policy the user is implementing (automatic Q4 to save RAM/VRAM).
 // 1.0 = FP8 (1 byte/param). 0.5 = Q4 (nibble/param). This HALVES the bytes
-// that must move, which is the single biggest lever on a Gen2/SATA2 rig.
+// that must move, which is the single biggest lever on a Gen2/NVMe rig.
 double g_bytes_per_param = 0.5;
 
 uint64_t params_embeddings() { return kVocab * kHidden; }        // ~508M
@@ -144,7 +144,9 @@ int main() {
                 per_token_moe / (double)kGiB);
     std::printf("  if 100%% served from RAM @ %.1f GB/s (Gen2): %.0f ms\n",
                 g_pcie_gbs, per_token_moe / g_pcie_gbs / 1e6);
-    std::printf("  if 50%% cold from SSD @ %.2f GB/s (SATA2)  : ~%.0f ms  <-- danger\n",
+    std::printf("  if 100%% cold from NVMe @ %.2f GB/s (adapter) : ~%.0f ms  <-- avoids RAM\n",
+                g_ssd_gbs, per_token_moe / g_ssd_gbs / 1e6);
+    std::printf("  if 50%% NVMe / 50%% RAM @ %.2f GB/s           : ~%.0f ms\n",
                 g_ssd_gbs,
                 (0.5 * per_token_moe / g_ssd_gbs + 0.5 * per_token_moe / g_pcie_gbs) / 1e6);
 
@@ -188,9 +190,9 @@ int main() {
         std::printf("  (1) attention + shared experts + lm_head stay resident in VRAM\n");
         std::printf("      (%.1f GB of 3.8 GB),\n", must_hot_in_vram / (double)kGiB);
         std::printf("  (2) the 320 active experts/token are served Q4 from RAM (hot)\n");
-        std::printf("      via routing-predictor prefetch (never from the SATA2 SSD),\n");
+        std::printf("      via routing-predictor prefetch (never from NVMe unless needed),\n");
         std::printf("  (3) Python overhead is removed from the per-token hot loop.\n");
-        std::printf(" The killer is SSD leakage: at SATA2, even 10%% cold costs ~%.0f ms.\n",
+        std::printf(" NVMe-as-backing at ~500MB/s is tolerable: 10%% cold adds only ~%.0f ms.\n",
                     (0.1 * per_token_q4 / g_ssd_gbs + 0.9 * per_token_q4 / g_pcie_gbs) / 1e6);
     } else {
         std::printf(" ALWAYS-HOT set does NOT fit (%.1f/%.1f GB) -> need to demote\n",
